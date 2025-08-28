@@ -1,0 +1,202 @@
+import sqlite3
+import pandas as pd
+import os
+import faiss
+import pickle
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.schema import Document
+
+# Set your OpenAI API key
+# os.environ["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"] 
+# === PATHS ===
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DB_PATH = os.path.join(PROJECT_ROOT, "reviews.db")
+VECTORSTORE_DIR = os.path.join(PROJECT_ROOT, "vectorstores")
+os.makedirs(VECTORSTORE_DIR, exist_ok=True)
+
+print("📁 Using DB at:", DB_PATH)
+print("📂 DB file exists?", os.path.exists(DB_PATH))
+
+# === LLMs ===
+llm = ChatOpenAI(model="gpt-4o")
+embedding_model = OpenAIEmbeddings()
+
+# === Utility: Split review text ===
+def split_reviews_to_docs(texts):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    return [Document(page_content=t) for t in text_splitter.split_text("\n".join(texts))]
+
+# === Utility: Check vector store path ===
+def get_vectorstore_path(product_table):
+    return os.path.join(VECTORSTORE_DIR, f"{product_table}.faiss")
+
+# === SEMANTICS AGENT ===
+def semantics_agent(user_prompt: str, product_table: str) -> str:
+    print(f"🧠 [Semantics Agent] Reasoning for table '{product_table}'...")
+    vs_path = get_vectorstore_path(product_table)
+    pkl_path = vs_path.replace(".faiss", ".pkl")
+
+    # STEP 1: Try loading existing vector store
+    if os.path.exists(vs_path) and os.path.exists(pkl_path):
+        try:
+            print("🔁 Reusing existing vector store...")
+            vectorstore = FAISS.load_local(vs_path.replace(".faiss", ""), embedding_model, allow_dangerous_deserialization=True)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+            docs = retriever.get_relevant_documents(user_prompt)
+
+            if docs:
+                print("✅ Found relevant vectors. Using cached vector store.")
+                qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=False)
+                return qa.run(user_prompt)
+            else:
+                print("⚠️ No relevant documents in existing vector store. Rebuilding...")
+        except Exception as e:
+            print("⚠️ Failed to load vector store:", e)
+
+    # STEP 2: Ask LLM for SQL query
+    sql_prompt = f"""
+        You are a smart assistant analyzing customer reviews for product insight. The user asked: "{user_prompt}"
+
+        Your task is to:
+        1. Extract relevant review data (e.g., title, content, rating, translated_review).
+        2. Include the 'rating' column in your SQL to enable reasoning about overall satisfaction.
+        3. The LLM will later analyze the average rating to understand if users are generally satisfied or not.
+        4. Including all reviews will help the LLM determine if some extreme ratings (e.g., very low or very high) are skewing the overall feedback.
+
+        The review table is called: {product_table}
+
+        Here are the valid column names you can use:
+        asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags.
+
+        Write a single SQL SELECT query that includes at least: rating, title, content, translated_review.
+        Do NOT filter with WHERE unless clearly required by the prompt.
+
+        Respond only with the SQL query. No markdown or explanations.
+        """
+
+    sql_query = llm.invoke(sql_prompt).content.replace("```sql", "").replace("```", "").strip()
+    print(f"📄 SQL generated:\n{sql_query}")
+
+    # STEP 3: Query database
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(sql_query, conn)
+    except Exception as e:
+        conn.close()
+        return f"❌ SQL failed: {e}"
+    conn.close()
+
+    if df.empty:
+        return "🟡 No matching reviews found for reasoning."
+
+    # STEP 4: Create vector store and save it
+    review_texts = df.apply(lambda row: ' '.join([str(v) for v in row if v]), axis=1).tolist()
+    docs = split_reviews_to_docs(review_texts)
+    vectorstore = FAISS.from_documents(docs, embedding_model)
+    vectorstore.save_local(vs_path.replace(".faiss", ""))  # saves both .faiss and .pkl
+
+    # STEP 5: Respond using vector store
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=vectorstore.as_retriever(search_kwargs={"k": 6}),
+        return_source_documents=False
+    )
+
+    print("🔍 Reasoning with new vector store...")
+    response = qa_chain.run(user_prompt)
+
+    return response
+
+
+def enrich_reviews_with_semantic_tags(product_table: str) -> str:
+    """
+    Adds semantic tags to each review in the specified product table.
+    Tags help classify the review's tone, detail, and trustworthiness.
+    """
+
+    print(f"🧠 [Semantics Agent] Enriching reviews in table: {product_table}")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Step 1: Fetch all reviews
+    try:
+        df = pd.read_sql_query(
+            f"SELECT id, rating, title, content, translated_review FROM {product_table}",
+            conn
+        )
+    except Exception as e:
+        conn.close()
+        return f"❌ Failed to read from {product_table}: {e}"
+
+    if df.empty:
+        conn.close()
+        return f"🟡 No reviews found in table {product_table}."
+
+    updates = []
+
+    for _, row in df.iterrows():
+        review_id = row["id"]
+        review_text = " ".join([
+            str(row.get("title") or ""),
+            str(row.get("content") or ""),
+            str(row.get("translated_review") or "")
+        ])
+
+        # Step 2: Ask LLM to tag the review
+        tag_prompt = f"""
+You are a review classification assistant. Tag the following review using one or more of the categories below. If you use contradictory, do not choose positive and negative for that review.
+Return only a comma-separated list of tags — no explanation.
+
+Tags:
+- positive: Review expresses clear satisfaction or praise.
+- negative: Review expresses clear dissatisfaction or complaint.
+- helpful: Review contains specific, actionable insights that would assist another buyer.
+- Vague: Review is not clear, generic, or lacks information and details to aid buyer decision-making.
+- contradictory: The review contains internally conflicting statements, both positive and negative (e.g., “great product, but unusable”).
+- low-effort: Review is overly short, lacks detail, or feels careless (e.g., “Bad”, “Okay”, “Not good”).
+- no justification: Review expresses sentiment without supporting explanation (e.g., “It sucks.”, “I’m disappointed.”).
+- duplicate: Review appears copied from another review, or repeats the same content seen in multiple reviews.
+- potentially misleading: Review may misrepresent the product (e.g., off-topic complaints, or expectations not promised).
+
+Examples:
+• “Bad. Never ever buy again.” → negative, low-effort, no justification
+• “Stopped charging after 2 weeks. Waste of money.” → negative, helpful
+• “Great product. Works exactly as advertised.” → positive, helpful
+• “I love it but it broke immediately.” → contradictory, vague
+• “Worst purchase.” → negative, low-effort, no justification
+
+Review:
+\"\"\"{review_text}\"\"\"
+"""
+
+        try:
+            tags = llm.invoke(tag_prompt).content.strip()
+            updates.append((tags, review_id))
+        except Exception as e:
+            print(f"⚠️ Skipping review {review_id} due to error: {e}")
+            continue
+
+    # Step 3: Apply tags to database
+    try:
+        cursor.executemany(
+            f"UPDATE {product_table} SET semantic_tags = ? WHERE id = ?",
+            updates
+        )
+        conn.commit()
+        print(f"✅ Updated {len(updates)} rows with semantic tags.")
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Failed to update rows: {e}")
+    finally:
+        conn.close()
+
+    return f"🏷️ Semantic tagging complete for {product_table}."
+
+
+# Alias for orchestrator usage
+run_semantics_agent = semantics_agent
