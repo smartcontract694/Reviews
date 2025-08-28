@@ -1,0 +1,309 @@
+from langchain_core.tools import tool
+from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_openai import ChatOpenAI
+from typing import TypedDict, Optional
+import sqlite3
+import pandas as pd
+from datetime import datetime
+import os
+import difflib
+import json
+import re
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import JsonOutputParser
+from agents.semantics_agent import run_semantics_agent
+from agents.data_analytics_agent import run_data_analytics_agent
+# Set your OpenAI API key
+#os.environ["OPENAI_API_KEY"] 
+os.environ["OPENAI_API_KEY"]
+# === DATABASE SETTINGS ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "reviews.db")
+#DB_PATH = r"C:\Users\hp\Documents\LLMReviewProject\reviews.db"
+# === USER PROMPT PARSING ===
+class PromptMetadata(TypedDict):
+    product_name: Optional[str]
+    date_range: Optional[str]
+
+llm = ChatOpenAI(model="gpt-4o")
+
+class PromptSchema(BaseModel):
+    product_name: Optional[str] = Field(..., description="The product name being asked about")
+    date_range: Optional[str] = Field(..., description="The time period of interest")
+
+parser = JsonOutputParser(pydantic_schema=PromptSchema)
+
+@tool
+def translate_prompt_tool(prompt: str) -> dict:
+    """
+    Detects the language of the given prompt and translates it to English.
+    Returns a dictionary with original language and English translation.
+    """
+    response = llm.invoke(f"""
+You are a language translation assistant.
+
+Step 1: Detect the language of the following prompt.
+Step 2: Translate it to English if it’s not already in English.
+Step 3: ONLY output a JSON object like this:
+{{
+  "language": "Arabic",
+  "translation": "Show me the rating breakdown for Samsung S23"
+}}
+
+Do NOT include any explanation or markdown. Return only the JSON.
+
+Prompt: {prompt}
+""")
+
+    try:
+        raw = response.content.strip()
+
+        # ✅ Extract just the JSON block using regex
+        match = re.search(r'\{[\s\S]*?\}', raw)
+        if match:
+            return json.loads(match.group(0))
+        else:
+            raise json.JSONDecodeError("No JSON object found", raw, 0)
+
+    except json.JSONDecodeError:
+        # Fallback to assuming English if parsing fails
+        return {"language": "English", "translation": prompt}
+@tool
+def extract_prompt_entities(prompt: str) -> PromptMetadata:
+    """Use LLM to extract product name and date range from prompt using structured output."""
+    chain = llm | parser
+    try:
+        result = chain.invoke(f"""
+                    You are a strict JSON extractor. Return ONLY valid JSON with these two fields: product_name and date_range.
+                    If date is not mentioned, use null. Example:
+                    {{"product_name": "Samsung Galaxy S23", "date_range": null}}
+
+                    Prompt: "{prompt}"
+                    """)
+        return result
+    except Exception as e:
+        print("⚠️ Fallback to regex due to parse error:", e)
+        product_match = re.search(r"(?:reviews? of|for)\s+(.+?)(?:\?|$)", prompt, re.IGNORECASE)
+        product_name = product_match.group(1).strip() if product_match else None
+        return {
+            "product_name": product_name,
+            "date_range": None
+        }
+
+@tool
+def check_data_availability(product_name: str) -> Optional[str]:
+    """Use LLM to match the product name to a table name in the database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    if not tables:
+        return None
+
+    prompt = f"""
+            You are a database assistant. A user is asking about the product: "{product_name}".
+
+            Here are the table names currently in the database:
+            {tables}
+            
+
+            Return ONLY the name of the most appropriate table from the list that matches this product. If none are appropriate, return "NONE".
+            If a product has a model number, then you must be strict about choosing the correct matching table with the matching model number. 
+            """
+    response = llm.invoke(prompt).content.strip()
+
+    if response.upper() == "NONE":
+        return None
+
+    return response
+
+
+# === DATA RETRIEVAL ===
+@tool
+def trigger_data_retrieval(product_name: str) -> Optional[str]:
+    """Fetch data from Amazon and store in DB. Return the inserted table name if successful."""
+    from agents.retrieval_agent.sources.amazonUAE import retrieve_and_store_reviews
+
+    normalized_input = product_name.replace(" ", "_").lower()
+    df = retrieve_and_store_reviews(product_name)
+
+    if df.empty:
+        return None
+
+    # ✅ Return the expected table name (same as used by retrieve_and_store_reviews)
+    return normalized_input
+
+# === SQL QUERY TOOL ===
+@tool
+def query_database(product_name: str, query: str) -> str:
+    """Run SQL query on product's table and return results."""
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(query.format(table=product_name), conn)
+    conn.close()
+    return df.to_string(index=False)  # Always return raw, even if empty
+
+
+# === Data analytics STUBS ===
+@tool
+def analytics_agent(product_name: str, prompt: str) -> str:
+    """Perform data analytics (charts, trends, visual summaries) on reviews for the product."""
+    return run_data_analytics_agent(prompt, product_name)
+
+# === MAIN ORCHESTRATOR ===
+def orchestrator(prompt: str) -> str:
+     # Step 0: Detect language and translate prompt
+    lang_info = translate_prompt_tool.invoke(prompt)
+    original_lang = lang_info.get("language", "English")
+    english_prompt = lang_info.get("translation", prompt)
+    original_prompt = prompt;
+    print(f"🌐 Detected Language: {original_lang}")
+    print(f"📝 Translated Prompt: {english_prompt}")
+    prompt = english_prompt;
+    entities = extract_prompt_entities.invoke(prompt)
+    product = entities["product_name"]
+    print(f"🔍 Extracted product name: {product}")
+    
+    if not product:
+        return _maybe_translate("❌ Could not extract product from the prompt.", original_lang)
+
+    matched_table = check_data_availability.invoke(product)
+    if not matched_table:
+        print("🟡 Data missing. Retrieving...")
+        matched_table = trigger_data_retrieval.invoke(product)
+        if not matched_table:
+            return _maybe_translate("❌ Retrieval failed.", original_lang)
+    
+    print(f"✅ Using matched table: {matched_table}")
+
+    # Step 2: Ask LLM what to do after data is available
+    routing_decision = llm.invoke(f"""
+        User prompt: "{prompt}"
+
+        You are deciding what type of processing the user prompt needs. Choose ONE:
+        (1) DIRECT_SQL — for exact values like counts, names, or single facts (e.g., "How many 5-star reviews?")
+        (2) ANALYTICS — for plot or show or draw and for visualizations like bar charts, pie charts, trends, or comparisons across groups (e.g., "Show how many users reviewed from each country", "Plot rating trends over time")
+        (3) SEMANTICS — for reasoning or insights from review content (e.g., "Why are reviews mixed?", "What problems are users facing?")
+        If the word 'show' is used in the prompt, the user needs visualization.
+        Only return one of: DIRECT_SQL, ANALYTICS, or SEMANTICS
+        """).content.strip().upper()
+    print(f"📌 Routing decision: {routing_decision}")
+
+    if routing_decision == "DIRECT_SQL":
+        sql_query = llm.invoke(f"""
+            You are generating SQLite queries.
+
+            Given this user prompt:
+            "{prompt}"
+
+            You MUST assume that each product has its own table named like `samsung_galaxy_s24`.
+             The table to analyze is: {matched_table}
+
+            The available columns in the table are:
+            asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags
+
+            DO NOT use any WHERE clause to filter by product again.
+
+            Respond with ONLY a valid SQLite query using the table name: {matched_table}
+        """).content.strip()
+
+        sql_query = re.sub(r"```sql|```", "", sql_query).strip()
+        print(f"🧠 Generated SQL Query:\n{sql_query}")
+
+        if not sql_query or not sql_query.lower().startswith("select"):
+            return _maybe_translate("❌ SQL generation failed or returned an invalid query.", original_lang)
+
+        try:
+            # Step 1: Get raw SQL result
+            raw_sql_result = query_database.invoke({"product_name": matched_table, "query": sql_query})
+
+            # Step 2: Use LLM to rephrase it naturally
+            natural_response = llm.invoke(f"""
+            You are a helpful assistant. A user asked: "{prompt}"
+
+            The SQL query result was:
+            {raw_sql_result}
+
+            Respond with a short, clear, human-like answer based on that result. Do NOT return raw SQL data — explain it naturally.
+            """).content.strip()
+
+            return _maybe_translate(natural_response, original_lang)
+
+        except Exception as e:
+            return _maybe_translate(f"❌ Error executing query: {str(e)}", original_lang)
+
+    elif routing_decision == "ANALYTICS":
+        # image_path, explanation = run_data_analytics_agent(prompt, matched_table)
+        #return f"[Analytics Agent] 📈 Chart saved as: {image_path}\n\n🧾 Explanation:\n{explanation}"
+        result = run_data_analytics_agent(original_prompt, matched_table)
+       # First check for error — before doing anything else
+        if "error" in result:
+            #return _maybe_translate(result["error"], original_lang)
+            return (result["error"])
+        # Then translate the explanation (if it exists)
+        #translated_explanation = _maybe_translate(result.get("explanation", ""), original_lang)
+
+        # Return the final response
+        return {
+            "type": "chart",
+            "path": result.get("image_path", ""),
+            "base64": result.get("image_b64", ""),
+            "explanation": result.get("explanation")
+        }
+        
+
+
+    elif routing_decision == "SEMANTICS":
+        semantics_response = run_semantics_agent(user_prompt=prompt, product_table=matched_table)
+        return _maybe_translate(semantics_response, original_lang)
+    return _maybe_translate("❌ Could not classify the user prompt.", original_lang)
+
+
+
+def _maybe_translate(text: str, target_lang: str) -> str:
+    if target_lang.lower() in ["english", "en"]:
+        return text
+
+    translation_prompt = f"""You are a professional translator. Translate the following text to {target_lang}:
+
+    {text}
+    """
+
+    translated = llm.invoke(translation_prompt).content.strip()
+    return translated
+
+
+#Example
+if __name__ == "__main__":
+    user_prompt = "Show the distribution of review ratings for Samsung S23"
+    print("🎯 User Prompt:", user_prompt)
+    result = orchestrator(user_prompt)
+    print("📦 Response:\n", result)
+    
+    
+    
+# if __name__ == "__main__":
+#     user_prompt = "How many reviews of Samsung S23 do you have?"
+#     print("🎯 User Prompt:", user_prompt)
+    
+#     # === DEBUG: Print tables and their row counts ===
+#     print("\n🔍 Inspecting database at path:", DB_PATH)
+#     conn = sqlite3.connect(DB_PATH)
+#     cursor = conn.cursor()
+    
+#     # Get all table names
+#     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+#     tables = [row[0] for row in cursor.fetchall()]
+#     print("📋 Tables found:", tables)
+
+#     # Print row counts per table
+#     for table in tables:
+#         try:
+#             cursor.execute(f"SELECT COUNT(*) FROM {table};")
+#             count = cursor.fetchone()[0]
+#             print(f"📦 Table '{table}' has {count} rows.")
+#         except Exception as e:
+#             print(f"⚠️ Could not read from table '{table}':", e)
+    
+#     conn.close()
