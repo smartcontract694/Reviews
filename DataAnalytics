@@ -1,0 +1,176 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+from langchain_openai import ChatOpenAI
+from openai import OpenAI
+from openai import OpenAI
+from PIL import Image
+import base64
+from io import BytesIO
+
+
+# Set your OpenAI API key
+#os.environ["OPENAI_API_KEY"] 
+os.environ["OPENAI_API_KEY"] 
+
+# === CONFIGURATION ===
+DB_PATH = "C:/Users/hp/Documents/LLMReviewProject/reviews.db"
+llm = ChatOpenAI(model="gpt-4o")  # still used for code generation
+
+# === Helper to encode image ===
+def encode_image_to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+# === DATA ANALYTICS AGENT ===
+# def run_data_analytics_agent(user_prompt: str, product_table: str) -> str:
+#     print(f"📊 [Analytics Agent] Processing table: {product_table} based on prompt: '{user_prompt}'")
+
+#     # Step 1: Ask LLM to generate Python code for analytics
+#     code_prompt = f"""
+#         You are a data analyst writing Python code to generate charts based on user questions.
+#         The user prompt is: "{user_prompt}"
+
+#         The SQLite database is located at: {DB_PATH}
+#         The table to analyze is: {product_table}
+
+#         The available columns in the table are:
+#         asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags
+
+#         ✅ Generate Python code to:
+#             1. Connect to the database.
+#             2. Extract any necessary data based on the user prompt.
+#             3. Use matplotlib to generate a chart (bar, pie, line, etc.) appropriate for the question.
+#             4. Ensure the chart is **visually balanced** even if there is only one category or bar.
+#             5. Add axis labels, title, rotated ticks if needed.
+#             6. Save the chart as 'chart.png' using:
+#                plt.tight_layout()
+#                plt.savefig('chart.png', format='png', bbox_inches='tight')
+
+#         ❌ Do not include plt.show().
+#         Only return executable Python code that ends with saving the chart.
+#     """
+#     code = llm.invoke(code_prompt).content.strip()
+#     if code.startswith("```"):
+#         code = code.strip("```").strip()
+#         code = code.replace("python", "").strip()
+
+#     print("📜 Generated Python code:\n", code)
+
+#     try:
+#         exec_globals = {"plt": plt, "pd": pd, "sqlite3": sqlite3, "os": os}
+#         exec(code, exec_globals)
+
+#         if os.path.exists("chart.png"):
+#             print("✅ Chart saved as chart.png")
+
+#             # Step 2: Encode image and send to OpenAI for interpretation
+#             image_b64 = encode_image_to_base64("chart.png")
+#             image_input = {
+#                 "model": "gpt-4o",
+#                 "messages": [
+#                     {"role": "system", "content": "You are a data visualization expert."},
+#                     {"role": "user", "content": [
+#                         {"type": "text", "text": f"This chart was generated for the question: '{user_prompt}'. Please explain what the chart shows in a few sentences."},
+#                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+#                     ]}
+#                 ],
+#                 "max_tokens": 300
+#             }
+
+            
+#             client = OpenAI()
+#             response = client.chat.completions.create(**image_input)
+#             explanation = response.choices[0].message.content.strip()
+
+#             return "chart.png", explanation
+#         else:
+#             return "❌ Chart file was not generated.", ""
+#     except Exception as e:
+#         print("❌ Error while executing generated code.")
+#         return f"❌ Failed to generate chart: {e}", ""
+
+
+def run_data_analytics_agent(user_prompt: str, product_table: str) -> dict:
+    print(f"📊 [Analytics Agent] Processing table: {product_table} based on prompt: '{user_prompt}'")
+
+    # Step 1: Ask LLM to generate Python code for analytics
+    code_prompt = f"""
+        You are a data analyst writing Python code to generate charts based on user questions.
+        You need to answer in the same language as the prompt. Any genrated code with charts should use labels and a title with the 
+        same lang8uage as the prompt language.
+        The user prompt is: "{user_prompt}"
+
+        The SQLite database is has reviews in multiple langauges, but the translated reviews are all in English. It is located at: {DB_PATH}
+        The table to analyze is: {product_table}
+
+        The available columns in the table are:
+        asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags
+
+        ✅ Generate Python code to:
+            1. Connect to the database.
+            2. Extract any necessary data based on the user prompt.
+            3. Convert the 'rating' column to numeric using:
+                df['rating'] = pd.to_numeric(df['rating'], errors='coerce')
+                df = df.dropna(subset=['rating'])
+            4. Use matplotlib to generate a chart (bar, pie, line, etc.) appropriate for the question.
+            5. Ensure the chart is visually balanced even if there is only one category or bar.
+            6. Add axis labels, title, rotated ticks if needed.
+            7. Save the chart as 'chart.png' using:
+                plt.tight_layout()
+                plt.savefig('static/chart.png', format='png', bbox_inches='tight')
+            8. Ensure the labels do not overwrite eachother and no labels overwrite the title.
+            9. Make sure there is enough space between the title and the chart so the title is not over written by the labels.
+
+        ❌ Do not include plt.show().
+        Only return executable Python code that ends with saving the chart.
+    """
+    code = llm.invoke(code_prompt).content.strip()
+    if code.startswith("```"):
+        code = code.strip("```").replace("python", "").strip()
+
+    print("📜 Generated Python code:\n", code)
+
+    try:
+        exec_globals = {"plt": plt, "pd": pd, "sqlite3": sqlite3, "os": os}
+        exec(code, exec_globals)
+
+        if os.path.exists("static/chart.png"):
+            print("✅ Chart saved as chart.png")
+
+            # Step 2: Encode image and send to OpenAI for interpretation
+            image_b64 = encode_image_to_base64("static/chart.png")
+            image_input = {
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "You are a data visualization expert."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"This chart was generated for the question: '{user_prompt}'. Please explain using the prompt language only what the chart shows in a few sentences. The information should be based on the chart produced. The bigger the portion such as the bar length, the higher the value. Also if it is higher or taking more space in a pie chart , it means it is of higher value."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+                    ]}
+                ],
+                "max_tokens": 300
+            }
+
+            client = OpenAI()
+            response = client.chat.completions.create(**image_input)
+            explanation = response.choices[0].message.content.strip()
+
+            return {
+                "image_path": "chart.png",
+                "image_b64": image_b64,
+                "explanation": explanation
+            }
+
+        else:
+            return {
+                "error": "❌ Chart file was not generated."
+            }
+
+    except Exception as e:
+        print(f"❌ Error while executing generated code:\n{str(e)}")
+        return {
+            "error": f"❌ Failed to generate chart: {e}"
+        }
+
