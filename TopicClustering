@@ -1,0 +1,109 @@
+import sqlite3
+import pandas as pd
+import os
+from langchain_openai import ChatOpenAI
+
+# === Set OpenAI Key and DB Path ===
+# Set your OpenAI API key
+#os.environ["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"] 
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DB_PATH = os.path.join(PROJECT_ROOT, "reviews.db")
+
+# === Initialize LLM ===
+llm = ChatOpenAI(model="gpt-4o")
+
+def assign_topics_to_reviews(product_table: str) -> str:
+    print(f"🧠 [Topic Agent] Clustering topics for table: {product_table}")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    try:
+        df = pd.read_sql_query(
+            f"""SELECT id, title, content, translated_review FROM {product_table}""",
+            conn
+        )
+    except Exception as e:
+        conn.close()
+        return f"❌ Failed to read from {product_table}: {e}"
+
+    if df.empty:
+        conn.close()
+        return f"🟡 No reviews to process for topic clustering in {product_table}."
+
+    # Combine text and prepare for topic classification
+    full_texts = df.apply(
+        lambda row: " ".join([
+            str(row.get("title") or ""),
+            str(row.get("translated_review") or row.get("content") or "")
+        ]).strip(),
+        axis=1
+    ).tolist()
+
+    # Step 1: Ask LLM to infer topics
+    topic_prompt = f"""
+    You are analyzing reviews for a product to identify common discussion topics. The topics should be in English only. 
+    The translated_review column is sued to come up with the correct topics.  
+
+    Based on the following reviews, return a list of 5–10 relevant and distinct topics 
+    these reviews are most likely addressing aspects of the product. you can know the product from the table name (e.g., delivery, battery, size, charger,camera,fitting,waiting time,customer service etc.)
+
+    Reviews:
+    {" | ".join(full_texts[:30])}  # Use a sample of 30 to keep context short
+
+    Respond with a comma-separated list only.
+    """
+    try:
+        topic_list = llm.invoke(topic_prompt).content.strip()
+        topics = [t.strip().lower() for t in topic_list.split(",") if t.strip()]
+        print("📌 Inferred topics:", topics)
+    except Exception as e:
+        conn.close()
+        return f"❌ Failed to infer topics: {e}"
+
+    # Step 2: Classify each review into one of those topics
+    updates = []
+    for i, row in df.iterrows():
+        review_id = row["id"]
+        review_text = " ".join([
+            str(row.get("title") or ""),
+            str(row.get("translated_review") or "")
+        ]).strip()
+
+        classify_prompt = f"""
+        You are assigning a topic to the following product review.
+
+        Choose ONE of these topics: {", ".join(topics)}
+
+        Review:
+        "{review_text}"
+
+        Respond with the topic only.
+        """
+        try:
+            topic = llm.invoke(classify_prompt).content.strip().lower()
+            updates.append((topic, review_id))
+        except Exception as e:
+            print(f"⚠️ Skipped review ID {review_id}: {e}")
+            continue
+
+    # Step 3: Update topics in database
+    try:
+        cursor.executemany(
+            f"UPDATE {product_table} SET topic = ? WHERE id = ?",
+            updates
+        )
+        conn.commit()
+        print(f"✅ Updated {len(updates)} reviews with topics.")
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Failed to update topics: {e}")
+    finally:
+        conn.close()
+
+    return f"🏷️ Topic clustering complete for {product_table}."
+
+# Example usage:
+# topic_clustering_agent("samsung_s22")
