@@ -1,0 +1,456 @@
+import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from agents.semantics_agent import enrich_reviews_with_semantic_tags
+from agents.language_agent import translate_and_tag_languages
+from agents.topic_clustering_agent import assign_topics_to_reviews
+from bs4 import BeautifulSoup
+import time
+import pandas as pd
+import re
+import sqlite3
+import os
+
+# from fake_useragent import UserAgent  # Optional
+# Optional: Use a random user agent
+# ua = UserAgent()
+# user_agent = ua.random
+
+
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+
+# def search_amazon_ae(product_name):
+#     search_query = product_name.replace(" ", "+")
+#     url = f"https://www.amazon.ae/s?k={search_query}"
+#     response = requests.get(url, headers=HEADERS)
+
+#     if response.status_code != 200:
+#         print("❌ Failed to fetch search results.")
+#         return None, None, None
+
+#     soup = BeautifulSoup(response.text, "html.parser")
+
+#     # 🔁 Try a more flexible selector for product links
+#     result = soup.select_one('div[data-asin] a.a-link-normal[href*="/dp/"]')
+
+#     if not result:
+#         print("❌ No product found for your search.")
+#         with open("debug_amazon_search.html", "w", encoding="utf-8") as f:
+#             f.write(response.text)
+#         return None, None, None
+
+#     href = result.get("href", "")
+#     asin_match = re.search(r"/dp/([A-Z0-9]{10})", href)
+#     asin = asin_match.group(1) if asin_match else None
+
+#     # Get title more reliably
+#     title_element = result.find("span", class_="a-text-normal")
+#     title = ' '.join(title_element.stripped_strings) if title_element else "Unknown Product"
+
+#     if asin:
+#         seller = get_seller_name(asin)
+#         return asin, title, seller
+
+#     return None, None, None
+
+
+def search_amazon_ae(product_name):
+    search_query = product_name.replace(" ", "+")
+    url = f"https://www.amazon.ae/s?k={search_query}"
+    response = requests.get(url, headers=HEADERS)
+
+    if response.status_code != 200:
+        print("❌ Failed to fetch search results.")
+        return None, None, None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    result = soup.find("a", attrs={"class": "a-link-normal s-no-outline"})
+    
+    if not result:
+        print("❌ No product found for your search.")
+        return None, None, None
+
+    href = result.get("href", "")
+    asin_match = re.search(r"/dp/([A-Z0-9]{10})", href)
+    asin = asin_match.group(1) if asin_match else None
+
+    element = result.find("span", class_="a-text-normal")
+    title = ' '.join(element.stripped_strings) if element else "does not exist"
+
+    if asin:
+        seller = get_seller_name(asin)
+        return asin, title, seller
+
+    return None, None, None
+
+
+def get_reviews_from_product_page(asin, seller):
+    options = Options()
+    options.add_argument("--start-maximized")
+
+    service = Service(r"C:\Users\hp\Documents\LLMReviewProject\chromedriver-win64\chromedriver.exe")
+    driver = webdriver.Chrome(service=service, options=options)
+
+    reviews = []
+
+    try:
+        # Manual login
+        login_url = (
+            "https://www.amazon.ae/ap/signin?"
+            "openid.pape.max_auth_age=0&"
+            "openid.return_to=https%3A%2F%2Fwww.amazon.ae%2F%3Fref_%3Dnav_signin&"
+            "openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+            "openid.assoc_handle=aeflex&"
+            "openid.mode=checkid_setup&"
+            "openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+            "openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+        )
+        driver.get(login_url)
+        print("🔐 Log in manually. Then go to the FIRST REVIEW PAGE.")
+        input("👉 Press Enter ONLY after you see the reviews loaded on the screen...")
+
+        # Page 1 only
+        page = 1
+        url = (
+            f"https://www.amazon.ae/product-reviews/{asin}/"
+            f"ref=cm_cr_arp_d_paging_btm_{page}"
+            f"?ie=UTF8&pageNumber={page}&reviewerType=all_reviews"
+        )
+        print(f"🔍 Visiting: {url}")
+        driver.get(url)
+
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-hook='review']"))
+            )
+        except Exception as e:
+            print(f"⚠️ Timeout waiting for reviews on page {page}: {e}")
+
+        html = driver.page_source
+        soup = BeautifulSoup(html, "html.parser")
+
+        with open(f"page_debug_{page}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
+        review_blocks = soup.select("[data-hook='review']")
+
+        if not review_blocks:
+            print(f"ℹ️ No reviews found on page {page}.")
+        else:
+            print(f"🔎 Found {len(review_blocks)} reviews on page {page}.")
+            for review in review_blocks:
+                reviews.append(extract_review(review, seller))
+
+        input("⏸ Done scraping. Press Enter to manually close browser...")
+
+    except Exception as e:
+        print(f"❌ ERROR: {e.__class__.__name__}: {e}")
+        input("🛑 Script crashed. Press Enter to keep browser open for inspection...")
+
+    return pd.DataFrame(reviews)
+
+
+
+# def get_reviews_from_product_page(asin, seller, max_pages=10):
+#     options = Options()
+#     options.add_argument("--start-maximized")
+
+#     service = Service(r"C:\Users\hp\Documents\LLMReviewProject\chromedriver-win64\chromedriver.exe")
+#     driver = webdriver.Chrome(service=service, options=options)
+
+#     reviews = []
+
+#     try:
+#         # Step 1: Manual login
+#         login_url = (
+#             "https://www.amazon.ae/ap/signin?"
+#             "openid.pape.max_auth_age=0&"
+#             "openid.return_to=https%3A%2F%2Fwww.amazon.ae%2F%3Fref_%3Dnav_signin&"
+#             "openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+#             "openid.assoc_handle=aeflex&"
+#             "openid.mode=checkid_setup&"
+#             "openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+#             "openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+#         )
+#         driver.get(login_url)
+#         print("🔐 Log in manually. Then go to the first review page.")
+#         input("👉 Press Enter ONLY after you see reviews on screen...")
+
+#         for page in range(1, max_pages + 1):
+#             url = f"https://www.amazon.ae/product-reviews/{asin}/?reviewerType=all_reviews&pageNumber={page}"
+#             print(f"🔍 Visiting: {url}")
+#             driver.get(url)
+#             time.sleep(3)
+
+#             html = driver.page_source
+#             soup = BeautifulSoup(html, "html.parser")
+
+#             # Debug save the page content
+#             with open(f"page_debug_{page}.html", "w", encoding="utf-8") as f:
+#                 f.write(html)
+
+#             local_reviews = soup.select("#cm-cr-dp-review-list > li")
+#             global_reviews = soup.select("#cm-cr-global-review-list > li")
+
+#             print(f"🔎 Found {len(local_reviews)} local and {len(global_reviews)} global reviews.")
+
+#             if not local_reviews and not global_reviews:
+#                 print(f"ℹ️ No reviews found on page {page}. Stopping pagination.")
+#                 break
+
+#             for review in local_reviews:
+#                 reviews.append(extract_review(review, seller, is_local=True))
+
+#             for review in global_reviews:
+#                 reviews.append(extract_review(review, seller, is_local=False))
+
+#             print(f"✅ Page {page}: Fetched {len(local_reviews) + len(global_reviews)} reviews.")
+
+#         input("⏸ Done scraping. Press Enter to manually close browser...")
+
+#     except Exception as e:
+#         print(f"❌ ERROR: {e.__class__.__name__}: {e}")
+#         input("🛑 Script crashed. Press Enter to keep browser open for inspection...")
+
+#     return pd.DataFrame(reviews)
+
+    
+def get_seller_name(asin):
+    url = f"https://www.amazon.ae/dp/{asin}"
+    response = requests.get(url, headers=HEADERS)
+
+    if response.status_code != 200:
+        print("❌ Failed to fetch seller info.")
+        return ""
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Try primary selector
+    seller_tag = soup.select_one("a#sellerProfileTriggerId")
+    if seller_tag:
+        return seller_tag.get_text(strip=True)
+
+    # Fallback: any <a> with the seller profile href
+    fallback_tag = soup.find("a", href=re.compile(r"/gp/help/seller/at-a-glance"))
+    if fallback_tag:
+        return fallback_tag.get_text(strip=True)
+
+    print("⚠️ Seller name not found.")
+    return ""
+
+def extract_review(review_div, seller):
+    # Reviewer name
+    author_tag = review_div.select_one(".a-profile-name")
+    author = author_tag.get_text(strip=True) if author_tag else ""
+
+    # Rating (e.g., "5.0 out of 5 stars")
+    rating_tag = review_div.select_one("i[data-hook='review-star-rating'] > span")
+    rating = rating_tag.get_text(strip=True).split(" out")[0] if rating_tag else ""
+
+    # Title
+    title_block = review_div.select_one("a[data-hook='review-title']")
+    title = ""
+    if title_block:
+        # Remove any <i> rating icons to avoid "5.0 out of 5 stars" leaking into title
+        for rating_icon in title_block.select("i"):
+            rating_icon.decompose()
+
+        # Collect text from all non-empty spans
+        span_texts = [span.get_text(strip=True) for span in title_block.find_all("span") if span.get_text(strip=True)]
+        title = " ".join(span_texts).strip()
+
+    # Date + Country (e.g., "Reviewed in the United Arab Emirates on 6 June 2024")
+    date_tag = review_div.select_one("span[data-hook='review-date']")
+    date_text = date_tag.get_text(strip=True) if date_tag else ""
+    country, date = "", ""
+    if "Reviewed in" in date_text and " on " in date_text:
+        parts = date_text.replace("Reviewed in ", "").split(" on ")
+        if len(parts) == 2:
+            country, date = parts[0], parts[1]
+
+    # Content
+    content_tag = review_div.select_one("span[data-hook='review-body'] span")
+    content = content_tag.get_text(strip=True) if content_tag else ""
+
+    # Verified purchase
+    verified_tag = review_div.select_one("span[data-hook='avp-badge']")
+    verified = verified_tag.get_text(strip=True) if verified_tag else ""
+
+    # Return all fields — including placeholders for enrichment
+    return {
+        "seller": seller,
+        "author": author,
+        "rating": rating,
+        "title": title,
+        "date": date,
+        "country": country,
+        "verified": verified,
+        "content": content,
+        "language": "",
+        "translated_review": "",
+        "topic": "",
+        "semantic_tags": ""
+    }
+
+    
+# def extract_review(review, seller, is_local=True):
+#     author_tag = review.select_one(".a-profile-name")
+#     author = author_tag.get_text(strip=True) if author_tag else ""
+
+#     rating_tag = review.select_one(".review-rating > span")
+#     rating = rating_tag.get_text(strip=True).replace("out of 5 stars", "") if rating_tag else ""
+
+#     date_tag = review.select_one(".review-date")
+#     date = date_tag.get_text(strip=True) if date_tag else ""
+
+#     title_tag = review.select_one(".review-title")
+#     if title_tag:
+#         all_spans = title_tag.find_all("span")
+#         clean_spans = [
+#             span.get_text(strip=True)
+#             for span in all_spans
+#             if "out of 5 stars" not in span.get_text()
+#         ]
+#         title = " ".join(clean_spans)
+#     else:
+#         title = ""
+
+#     content_tag = review.select_one(".a-expander-content.reviewText.review-text-content")
+#     content = content_tag.get_text(strip=True).replace("Read more", "") if content_tag else ""
+
+#     verified_element = review.select_one("span.a-size-mini")
+#     verified = verified_element.get_text(strip=True) if verified_element else None
+
+#     return {
+#         "seller": seller,
+#         "type": "local" if is_local else "global",
+#         "author": author,
+#         "rating": rating,
+#         "title": title,
+#         "content": content,
+#         "date": date,
+#         "verified": verified
+#     }
+
+
+def create_product_table(table_name):
+    conn = sqlite3.connect(DB_PATH)  # ✅ use consistent path
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asin TEXT,
+            seller TEXT,
+            author TEXT,
+            rating TEXT,
+            title TEXT,
+            date TEXT,
+            country TEXT,
+            verified TEXT,
+            content TEXT,
+            language TEXT,
+            translated_review TEXT,
+            topic TEXT,
+            semantic_tags TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Table '{table_name}' created.")
+
+
+
+
+# Utility to normalize table names
+def normalize_table_name(product_name):
+    return re.sub(r'\W+', '_', product_name.strip().lower())
+
+# Resolve path to reviews.db in the main project folder
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+DB_PATH = os.path.join(PROJECT_ROOT, "reviews.db")
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# DB_PATH = os.path.join(BASE_DIR, "reviews.db")
+
+# Run the scraper by the orchestrator
+def retrieve_and_store_reviews(product_name: str):
+    print(f"product name: {product_name}")
+    asin, title, seller = search_amazon_ae(product_name)
+
+    if not asin:
+        print("❌ Could not find the product.")
+        return pd.DataFrame()
+
+    print(f"✅ Found product: {title} (ASIN: {asin})")
+
+    # ✅ Now normalize the table name and create it
+    table_name = normalize_table_name(product_name)
+    create_product_table(table_name)
+
+    # ✅ Scrape reviews
+    df = get_reviews_from_product_page(asin, seller)
+
+    if df.empty:
+        print("⚠️ No reviews were found on the product page.")
+        return df
+
+    # Optional: save to CSV
+    filename = f"reviews_{asin}.csv"
+    df.to_csv(filename, index=False, encoding="utf-8-sig")
+    print(f"✅ Saved {len(df)} reviews to {filename}")
+
+    # ✅ Save to database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    for _, row in df.iterrows():
+        cursor.execute(f"""
+            INSERT INTO {table_name} (
+                asin, seller, author, rating, title, date, country,
+                verified, content, language, translated_review, topic, semantic_tags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            asin,
+            row.get("seller", ""),
+            row.get("author", ""),
+            row.get("rating", ""),
+            row.get("title", ""),
+            row.get("date", ""),
+            row.get("country", ""),
+            row.get("verified", ""),
+            row.get("content", ""),
+            row.get("language", ""),
+            row.get("translated_review", ""),
+            row.get("topic", ""),
+            row.get("semantic_tags", "")
+        ))
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Inserted {len(df)} reviews into local database table '{table_name}'.")
+    # 🔍 Add semantic tags
+    print("🔍 Enriching reviews with semantic tags...")
+    enrich_reviews_with_semantic_tags(table_name)
+    print("✅ Semantic tags successfully added to reviews.")
+     # ✅ Now run the translation agent
+    print("🌍 Translating reviews and tagging languages...")
+    translate_and_tag_languages(table_name)
+    print("✅ Language and translation successfully added to reviews.")
+    # ✅ Assign topics using Topic Clustering Agent
+    print("✅ Assigning topics using Topic Clustering Agent")
+    assign_topics_to_reviews(table_name)
+    return df
+
+
+
