@@ -1,0 +1,96 @@
+import sqlite3
+import pandas as pd
+from langchain_openai import ChatOpenAI
+import os
+
+# Set your OpenAI API key
+# os.environ["OPENAI_API_KEY"] 
+os.environ["OPENAI_API_KEY"] 
+# Initialize the LLM
+llm = ChatOpenAI(model="gpt-4o")
+
+# Path to your reviews.db
+DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "reviews.db"))
+
+def translate_and_tag_languages(product_table: str) -> str:
+    print(f"🌐 [Translation Agent] Processing table: {product_table}")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # ✅ Fetch ALL rows
+    try:
+        df = pd.read_sql_query(
+            f"SELECT id, title, content FROM {product_table}",
+            conn
+        )
+    except Exception as e:
+        conn.close()
+        return f"❌ Failed to read from {product_table}: {e}"
+
+    if df.empty:
+        conn.close()
+        return f"🟡 No reviews found in '{product_table}'."
+
+    updates = []
+
+    for _, row in df.iterrows():
+        review_id = row["id"]
+        review_text = " ".join([
+            str(row.get("title") or ""),
+            str(row.get("content") or "")
+        ]).strip()
+
+        if not review_text:
+            continue
+
+        # 🌍 LLM prompt
+        prompt = f"""
+You are a multilingual assistant helping with review processing.
+
+For the following product review:
+---
+{review_text}
+---
+
+Step 1: Detect the language. Return the ISO code (e.g., en, ar, fr, de).
+Step 2: If it's English, only return:
+LANGUAGE: en
+
+If it's not English, return:
+LANGUAGE: [code]
+TRANSLATION: [Translate the review to English accurately and clearly.]
+
+Output only the detected language and translation if needed.
+"""
+
+        try:
+            response = llm.invoke(prompt).content.strip()
+
+            lang_line = next((line for line in response.splitlines() if line.startswith("LANGUAGE:")), "")
+            trans_line = next((line for line in response.splitlines() if line.startswith("TRANSLATION:")), "")
+
+            lang = lang_line.replace("LANGUAGE:", "").strip()
+            translation = trans_line.replace("TRANSLATION:", "").strip() if trans_line else review_text
+
+            updates.append((lang, translation, review_id))
+
+        except Exception as e:
+            print(f"⚠️ Skipped review ID {review_id}: {e}")
+            continue
+
+    # ✅ Apply updates to database
+    try:
+        cursor.executemany(
+            f"UPDATE {product_table} SET language = ?, translated_review = ? WHERE id = ?",
+            updates
+        )
+        conn.commit()
+        print(f"✅ {len(updates)} reviews updated with language and translations.")
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Failed to update database: {e}")
+    finally:
+        conn.close()
+
+    return f"🌍 Language tagging & translation complete for '{product_table}'."
