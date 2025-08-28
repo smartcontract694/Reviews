@@ -1,0 +1,258 @@
+import sqlite3
+import pandas as pd
+import random
+import os
+import json
+import hashlib
+import io
+from langchain_openai import ChatOpenAI
+
+# === CONFIGURATION ===
+DB_PATH = "C:/Users/hp/Documents/LLMReviewProject/reviews.db"
+PRODUCT_NAME = "EV Charger"
+ASIN = "B0Z1XYY125"
+TABLE_NAME = "EV_charger"
+NUM_REVIEWS = 100
+
+# Set your OpenAI API key
+os.environ["OPENAI_API_KEY"] 
+
+llm = ChatOpenAI(model="gpt-4o")
+
+existing_hashes = set()
+
+# === Helper to create hash of review content ===
+def hash_review(review):
+    review_str = json.dumps(review, sort_keys=True)
+    return hashlib.sha256(review_str.encode()).hexdigest()
+
+# === Create table if not exists ===
+def setup_table():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asin TEXT,
+            seller TEXT,
+            author TEXT,
+            rating TEXT,
+            title TEXT,
+            date TEXT,
+            country TEXT,
+            verified TEXT,
+            content TEXT,
+            language TEXT,
+            translated_review TEXT,
+            topic TEXT,
+            semantic_tags TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# === Insert review to DB ===
+def insert_review(review):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        INSERT INTO {TABLE_NAME} 
+        (asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '')
+    """, (
+        review.get("asin", ASIN),
+        review.get("seller", ""),
+        review.get("author", ""),
+        review.get("rating", ""),
+        review.get("title", ""),
+        review.get("date", ""),
+        review.get("country", ""),
+        review.get("verified", ""),
+        review.get("content", "")
+    ))
+    conn.commit()
+    conn.close()
+
+# === Generate one unique review ===
+def generate_unique_review():
+    for _ in range(5):  # Retry up to 5 times
+        prompt = f"""
+Generate 1 product review for the product "{PRODUCT_NAME}".
+
+Constraints:
+- Review must be in any many languages such as spanish and French and English, Arabic, Chinese, Japanese,  etc
+- Provide a mix of negative sentiment and use appropriate rating range between bad → 1.0,then 2.0, 3.0, 4.0 for ok and good accordingly and maximum 5.0 for excellent)
+- Format date as random between 2023 and 2025 in ISO format example 2023-11-15
+- Use realistic names and country.
+- the tile should be in the same language as the review. It should be consistent.
+- Fields: asin, seller, author, rating, title, date, country, verified, content
+- Leave: language, translated_review, topic, semantic_tags empty
+- Verified: it is either verified purchase or not verified
+
+Respond ONLY as a JSON object like:
+{{
+  "asin": "...",
+  "seller": "...",
+  "author": "...",
+  "rating": "...",
+  "title": "...",
+  "date": "...",
+  "country": "...",
+  "verified": "...",
+  "content": "..."
+}}
+"""
+
+        try:
+            raw = llm.invoke(prompt).content.strip()
+            if raw.startswith("```json"):
+                raw = raw.replace("```json", "").replace("```", "").strip()
+            elif raw.startswith("```"):
+                raw = raw.replace("```", "").strip()
+
+            review = json.loads(raw)
+            review_hash = hash_review(review)
+
+            if review_hash not in existing_hashes:
+                existing_hashes.add(review_hash)
+                return review
+            else:
+                print("⚠️ Duplicate review, retrying...")
+        except Exception as e:
+            print("❌ LLM review generation failed:", e)
+        time.sleep(1)
+
+    print("❌ Failed to generate a unique review after retries.")
+    return None
+
+# === MAIN LOOP ===
+if __name__ == "__main__":
+    setup_table()
+    print("📝 Generating reviews one by one...")
+    count = 0
+    while count < NUM_REVIEWS:
+        review = generate_unique_review()
+        if review:
+            insert_review(review)
+            count += 1
+            print(f"✅ Inserted review {count}/{NUM_REVIEWS}")
+        else:
+            break
+
+
+
+# # === Generate reviews using LLM ===
+# def generate_reviews(product_name: str, asin: str, num_reviews: int = 300) -> list:
+#     prompt = f"""
+# You are a data generation assistant helping create **synthetic, fictional product reviews** for testing a multilingual review analysis system.
+
+# Please generate {num_reviews} **simulated and clearly fictitious** product reviews for the product: "{product_name}". These reviews are not real and are only used for software testing.
+
+# Each review should follow this format:
+# - Fields: asin, seller, author, rating, title, date, country, verified, content
+# - Reviews must be in different languages (e.g., English, Arabic, French, Spanish, German, etc.)
+# - Include positive, negative, and neutral feedback
+# - Ratings should match the sentiment:
+#   * Excellent → 5.0
+#   * Good → 4.0–4.5
+#   * Average → 3.0–3.5
+#   * Poor → 1.0–2.5
+# - Use fictional names and sellers.
+# - Date format: "13 July 2025"
+# - 'verified' must be either "Verified Purchase" or "Not Verified Purchase"
+# - Leave these fields empty: language, translated_review, topic, semantic_tags
+
+# Respond in valid JSON format: a JSON array of {num_reviews} review objects.
+# Do not explain anything — return **only the JSON array**.
+# """
+
+
+#     response = llm.invoke(prompt).content.strip()
+#     print("🔍 Raw LLM response (truncated):", response[:1000])
+
+#     try:
+#         # Remove markdown formatting
+#         if "```" in response:
+#             response = response.split("```")[-1].strip()
+
+#         # Try parsing JSON using pandas
+#         try:
+#             reviews = pd.read_json(io.StringIO(response))
+#         except Exception as e1:
+#             # If pandas fails, try manual json.loads
+#             try:
+#                 parsed = json.loads(response)
+#                 reviews = pd.DataFrame(parsed)
+#             except Exception as e2:
+#                 raise ValueError(f"Failed with pandas ({e1}) and json.loads ({e2})")
+
+#         # Enforce review count limit
+#         if len(reviews) > num_reviews:
+#             reviews = reviews.iloc[:num_reviews]
+
+#         # Validate required fields
+#         required_columns = {"asin", "seller", "author", "rating", "title", "date", "country", "verified", "content"}
+#         missing = required_columns - set(reviews.columns)
+#         if missing:
+#             raise ValueError(f"Missing required fields in LLM response: {missing}")
+
+#         return reviews.to_dict(orient="records")
+
+#     except Exception as e:
+#         print("❌ Failed to parse LLM output:", e)
+#         print("🪵 Full raw response:\n", response[:1500])  # Optional: helpful for debugging
+#         return []
+
+
+# # === Insert into SQLite database ===
+# def insert_reviews_to_db(reviews: list, table_name: str):
+#     conn = sqlite3.connect(DB_PATH)
+#     cursor = conn.cursor()
+
+#     cursor.execute(f"""
+#         CREATE TABLE IF NOT EXISTS {table_name} (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             asin TEXT,
+#             seller TEXT,
+#             author TEXT,
+#             rating TEXT,
+#             title TEXT,
+#             date TEXT,
+#             country TEXT,
+#             verified TEXT,
+#             content TEXT,
+#             language TEXT,
+#             translated_review TEXT,
+#             topic TEXT,
+#             semantic_tags TEXT
+#         )
+#     """)
+
+#     for review in reviews:
+#         cursor.execute(f"""
+#             INSERT INTO {table_name} 
+#             (asin, seller, author, rating, title, date, country, verified, content, language, translated_review, topic, semantic_tags)
+#             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '')
+#         """, (
+#             str(review.get("asin", ASIN)),
+#             str(review.get("seller", "")),
+#             str(review.get("author", "")),
+#             str(review.get("rating", "")),
+#             str(review.get("title", "")),
+#             str(review.get("date", "")),
+#             str(review.get("country", "")),
+#             str(review.get("verified", "")),
+#             str(review.get("content", ""))
+#         ))
+
+
+#     conn.commit()
+#     conn.close()
+#     print(f"✅ Inserted {len(reviews)} reviews into '{table_name}'.")
+
+# # === MAIN ===
+# if __name__ == "__main__":
+#     print("📝 Generating synthetic reviews using LLM...")
+#     review_data = generate_reviews(PRODUCT_NAME, ASIN, NUM_REVIEWS)
+#     if review_data:
+#         insert_reviews_to_db(review_data, TABLE_NAME)
