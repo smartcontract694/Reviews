@@ -1,0 +1,157 @@
+import sqlite3
+import random
+from datetime import datetime, timedelta
+from agents.semantics_agent import enrich_reviews_with_semantic_tags
+from agents.language_agent import translate_and_tag_languages
+from agents.topic_clustering_agent import assign_topics_to_reviews
+
+DB_PATH = "C:/Users/hp/Documents/LLMReviewProject/reviews.db"
+TABLE_NAME = "ThreeHundredReviews"
+# === timing_utils (inline) ===
+import time, csv, os
+from datetime import datetime
+from contextlib import contextmanager
+
+_TIMINGS_CSV = "timings.csv"  # change if you like
+
+def _write_timing(row: dict, csv_path: str = _TIMINGS_CSV):
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
+@contextmanager
+def timing_block(step_name: str, table_name: str = None, extra: dict = None):
+    t0 = time.perf_counter()
+    err = None
+    try:
+        yield
+    except Exception as e:
+        err = repr(e)
+        raise
+    finally:
+        ms = (time.perf_counter() - t0) * 1000.0
+        row = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "step": step_name,
+            "table": table_name or "",
+            "millis": round(ms, 2),
+            "error": err or "",
+        }
+        if extra:
+            row.update(extra)
+        _write_timing(row)
+        print(f"⏱️ {step_name} ({table_name or '-'}) took {row['millis']} ms" + (f" — ERROR: {err}" if err else ""))
+
+def randomize_review_dates(limit: int = 300):
+    """Randomize dates for the first `limit` rows ordered by id."""
+    # Date window
+    start_date = datetime.strptime("01 Jan 2024", "%d %b %Y")
+    end_date = datetime.strptime("25 July 2025", "%d %B %Y")
+    span_days = (end_date - start_date).days
+
+    # Use context manager to ensure commit/close; increase timeout to avoid 'database is locked'
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        cur = conn.cursor()
+        # Optional: slightly better concurrency behavior
+        cur.execute("PRAGMA journal_mode=WAL;")
+
+        # Get the first `limit` ids deterministically
+        cur.execute(f"SELECT id FROM {TABLE_NAME} ORDER BY id ASC LIMIT ?", (limit,))
+        ids = [row[0] for row in cur.fetchall()]
+        if not ids:
+            print("⚠️ No rows found to update.")
+            return
+
+        # Prepare updates
+        updates = []
+        for review_id in ids:
+            rnd = random.randint(0, span_days)
+            rnd_date = start_date + timedelta(days=rnd)
+            # Format like '13 July 2025' (no leading zero on day; Windows-safe)
+            formatted = rnd_date.strftime("%d %B %Y").lstrip("0")
+            updates.append((formatted, review_id))
+
+        # Bulk apply
+        cur.executemany(
+            f"UPDATE {TABLE_NAME} SET date = ? WHERE id = ?",
+            updates
+        )
+        conn.commit()
+
+    print(f"✅ Dates randomized for {len(updates)} rows (first {limit} ids).")
+
+# # === Step 2: Language Agent Enrichment ===
+# def run_language_enrichment():
+#     translate_and_tag_languages(TABLE_NAME)
+#     print("✅ Language enrichment completed.")
+
+# # === Step 3: Semantics Agent Enrichment ===
+# def run_semantics_enrichment():
+#     enrich_reviews_with_semantic_tags(TABLE_NAME)
+#     print("✅ Semantic tagging completed.")
+    
+
+# # === Step 4: Semantics Agent Enrichment ===
+# def run_topics_enrichment():
+#     enrich_reviews_with_semantic_tags(TABLE_NAME)
+#     print("✅ Topics tagging completed.")
+
+
+# import sqlite3
+# from datetime import datetime
+
+# if __name__ == "__main__":
+#     db_path = "C:/Users/hp/Documents/LLMReviewProject/reviews.db"
+#     conn = sqlite3.connect(db_path)
+#     cursor = conn.cursor()
+
+#     table = "samsung_galaxy_s23"
+
+#     # Read all original dates
+#     cursor.execute(f"SELECT rowid, date FROM {table}")
+#     rows = cursor.fetchall()
+
+#     for rowid, old_date in rows:
+#         try:
+#             # Convert from '12 January 2024' to '2024-01-12'
+#             dt = datetime.strptime(old_date.strip(), "%d %B %Y")
+#             iso_date = dt.strftime("%Y-%m-%d")
+
+#             # Update the row
+#             cursor.execute(f"UPDATE {table} SET date = ? WHERE rowid = ?", (iso_date, rowid))
+#         except Exception as e:
+#             print(f"Skipping row {rowid}: {old_date} -> {e}")
+
+#     conn.commit()
+#     conn.close()
+#     print("✅ Date format conversion complete.")
+
+
+
+
+  # print("🔁 Randomizing dates...")
+    # randomize_review_dates()
+
+
+# === Main Execution ===
+if __name__ == "__main__":
+    # Make sure TABLE_NAME is defined earlier
+    # from your_module import translate_and_tag_languages, assign_topics_to_reviews, enrich_reviews_with_semantic_tags
+
+    print("🌍 Translating reviews and tagging languages...")
+    with timing_block("LanguageDetectionAndTranslation", table_name=TABLE_NAME):
+        translate_and_tag_languages(TABLE_NAME)
+    print("✅ Language and translation successfully added to reviews.")
+
+    print("🧭 Assigning topics using Topic Clustering Agent...")
+    with timing_block("TopicInferenceAndTagging", table_name=TABLE_NAME):
+        assign_topics_to_reviews(TABLE_NAME)
+    print("✅ Topics successfully assigned to reviews.")
+
+    print("🔖 Enriching reviews with semantic tags...")
+    with timing_block("SemanticTagging", table_name=TABLE_NAME):
+        enrich_reviews_with_semantic_tags(TABLE_NAME)
+    print("✅ Semantic tags successfully added to reviews.")
